@@ -1,0 +1,23 @@
+KeelMap
+Copyright 2026 The KeelMap authors
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This product includes third-party material under its own licence:
+
+  Cytoscape.js 3.30.2
+  src/keelmap/report/vendor/cytoscape.min.js
+  MIT License, Copyright (c) 2016-2024 The Cytoscape Consortium
+  See src/keelmap/report/vendor/cytoscape.LICENSE
+
+  Test captures from Zeek (https://github.com/zeek/zeek), BSD License
+  tests/fixtures/public/lldp_smc_switch.pcap
+
+  Test captures from tcpdump (https://github.com/the-tcpdump-group/tcpdump), BSD License
+  tests/fixtures/public/lldp_mudurl.pcap, tests/fixtures/public/lldp_malformed_asan.pcap
+
+  AIS and NMEA 0183 sentences from pyais (https://github.com/M0r13n/pyais)
+  MIT License, Copyright (c) 2019 M0r13n
+  tests/fixtures/public/nmea_samples.txt
+
+Provenance for each fixture is recorded next to it in tests/fixtures/public/*.source.md.

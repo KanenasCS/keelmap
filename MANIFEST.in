@@ -1,0 +1,5 @@
+include LICENSE NOTICE CHANGELOG.md CONTRIBUTING.md SECURITY.md
+graft docs
+graft tests
+graft tools
+global-exclude __pycache__ *.py[cod]

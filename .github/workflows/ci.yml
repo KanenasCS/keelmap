@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install tshark for reference tests
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tshark
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check src tests tools
+      - name: Test
+        run: pytest -q
+      - name: Build and smoke test the wheel
+        run: |
+          pip install build
+          python -m build --wheel
+          python -m venv /tmp/wheeltest
+          /tmp/wheeltest/bin/pip install dist/*.whl
+          /tmp/wheeltest/bin/keelmap --version
+          /tmp/wheeltest/bin/keelmap scan tests/fixtures/public/lldp_smc_switch.pcap -o /tmp/inv.json --map /tmp/chart.html
+          grep -q "Asset chart" /tmp/chart.html

@@ -1,0 +1,19 @@
+# Captures can contain real vessel and network identifiers. Never commit them by default.
+*.pcap
+*.pcapng
+*.cap
+# Public fixtures are allowed only after review, see tests/fixtures/README.md
+!tests/fixtures/public/*.pcap
+!tests/fixtures/public/*.pcapng
+
+# Unredacted exports
+*.unredacted.json
+
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.venv/
+*.unredacted.html
+.ruff_cache/
+dist/
+build/
