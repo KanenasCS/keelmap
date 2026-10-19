@@ -18,6 +18,10 @@ Stored from each pair:
     device itself. Any other unit id may be a serial device behind a gateway,
     so the identity is not attached to the TCP endpoint.
 
+Memory: each pair is folded into per-source staging assets and communications
+as soon as it is seen, so nothing grows with capture length. Pending requests
+are capped, the oldest is counted as unanswered when the cap is reached.
+
 IP to asset: resolved after all frames are read. An IP joins an existing
 MAC-identity asset only if exactly one such asset has ARP or DHCP evidence for
 that IP AND the Modbus frame's Ethernet source is that same MAC. Otherwise
@@ -39,18 +43,12 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from keelmap.decoders.base import Frame
-from keelmap.layers import (
-    ETH_IPV4,
-    LINKTYPE_ETHERNET,
-    mac_str,
-    parse_ethernet,
-    parse_ipv4,
-    parse_tcp,
-)
-from keelmap.model import Asset, Evidence, EvidenceKind, Inventory
+from keelmap.layers import ETH_IPV4, is_host_ip, mac_str, parse_ipv4, parse_link, parse_tcp
+from keelmap.model import Asset, Communication, Evidence, EvidenceKind, Inventory
 from keelmap.resolve import IpResolver
 
 PORT = 502
+MAX_PENDING = 65_536
 _DEVICE_UNITS = {0, 255}
 _GATEWAY_EXCEPTIONS = {10, 11}
 _OBJ_VENDOR, _OBJ_PRODUCT_CODE, _OBJ_REVISION, _OBJ_MODEL = 0x00, 0x01, 0x02, 0x05
@@ -116,7 +114,7 @@ def _device_id(pdu: bytes) -> dict[int, str] | None:
         if len(raw) < length:
             return None
         try:
-            text = raw.decode("ascii").strip().rstrip("\x00")
+            text = raw.decode("ascii").strip(" \t\r\n\x00")
         except UnicodeDecodeError:
             text = ""
         if text and text.isprintable():
@@ -127,21 +125,21 @@ def _device_id(pdu: bytes) -> dict[int, str] | None:
 
 class ModbusDecoder:
     name = "modbus"
-    version = "0.1.0"
+    version = "0.1.1"
 
     def __init__(self) -> None:
         self.stats: Counter[str] = Counter()
         self._pending: dict[tuple, _Request] = {}
-        self._pairs: list[_Pair] = []
+        # staging, keyed by (ip, ethernet source), resolved to real assets in finish()
+        self._assets: dict[tuple[str, str], Asset] = {}
+        self._comms: dict[tuple, Communication] = {}
 
     @property
     def tag(self) -> str:
         return f"{self.name}@{self.version}"
 
     def handle(self, frame: Frame, inventory: Inventory) -> None:
-        if frame.linktype != LINKTYPE_ETHERNET:
-            return
-        eth = parse_ethernet(frame.data)
+        eth = parse_link(frame.linktype, frame.data)
         if eth is None or eth.ethertype != ETH_IPV4:
             return
         ip = parse_ipv4(eth.payload)
@@ -157,6 +155,9 @@ class ModbusDecoder:
             return
         if tcp.sport == tcp.dport:
             self.stats["modbus_both_ports_502_skipped"] += 1
+            return
+        if not (is_host_ip(ip.src) and is_host_ip(ip.dst)):
+            self.stats["modbus_endpoint_not_host_ip"] += 1
             return
         is_request = tcp.dport == PORT
         parsed = _split_adus(tcp.payload)
@@ -191,6 +192,10 @@ class ModbusDecoder:
                         # Same transaction id reused for a new request. Many simple clients
                         # always send id 0. The older request was never answered.
                         self.stats["modbus_request_unanswered"] += 1
+                        del self._pending[key]
+                    elif len(self._pending) >= MAX_PENDING:
+                        del self._pending[next(iter(self._pending))]
+                        self.stats["modbus_request_unanswered"] += 1
                     self._pending[key] = _Request(seen, tid, unit, fc, pdu, tcp.seq)
                 continue
 
@@ -215,55 +220,69 @@ class ModbusDecoder:
                     self.stats["modbus_device_id_malformed"] += 1
                 elif not dev:
                     self.stats["modbus_device_id_empty"] += 1
-            self._pairs.append(_Pair(req, seen, conn[1], conn[3], exception, dev))
+            self._record(_Pair(req, seen, conn[1], conn[3], exception, dev))
 
-    # resolution -------------------------------------------------------------------
+    # staging ------------------------------------------------------------------------
 
-    def _endpoint(self, resolve: IpResolver, ip: str, seen: _Seen, what: str) -> Asset:
-        asset = resolve(ip, seen.eth_src)
-        if asset.identity_key.startswith("ip:"):
-            asset.ips.add(ip, Evidence(EvidenceKind.OBSERVED, seen.sha, (seen.number,), seen.ts, self.tag,
-                                       f"IP source of Modbus {what}"))
-        return asset
+    def _stage(self, ip: str, seen: _Seen) -> Asset:
+        key = (ip, seen.eth_src)
+        if key not in self._assets:
+            self._assets[key] = Asset(f"ip:{ip}")
+        return self._assets[key]
+
+    def _record(self, p: _Pair) -> None:
+        r, s = p.req, p.resp
+        fc = r.fc
+        exc = f" exception {p.exception}" if p.exception is not None else ""
+        tx = f"transaction {r.tid}, unit {r.unit}"
+        client, server = self._stage(p.client_ip, r.seen), self._stage(p.server_ip, s)
+
+        req_ev = Evidence(EvidenceKind.OBSERVED, s.sha, (r.seen.number,), r.seen.ts, self.tag,
+                          f"Modbus FC{fc:02d} request, {tx}, answered in frame {s.number}")
+        resp_ev = Evidence(EvidenceKind.OBSERVED, s.sha, (s.number,), s.ts, self.tag,
+                           f"Modbus FC{fc:02d} response{exc}, {tx}, to request in frame {r.seen.number}")
+        pair_ev = Evidence(EvidenceKind.OBSERVED, s.sha, (r.seen.number, s.number), r.seen.ts, self.tag,
+                           f"Modbus FC{fc:02d} request and response{exc}, {tx}")
+
+        client.ips.add(p.client_ip, Evidence(EvidenceKind.OBSERVED, s.sha, (r.seen.number,), r.seen.ts, self.tag,
+                                             f"IP source of Modbus request, {tx}"))
+        server.ips.add(p.server_ip, Evidence(EvidenceKind.OBSERVED, s.sha, (s.number,), s.ts, self.tag,
+                                             f"IP source of Modbus response, {tx}"))
+        client.roles.add("modbus/client", req_ev)
+        server.roles.add("modbus/server", resp_ev)
+        if p.exception in _GATEWAY_EXCEPTIONS:
+            server.roles.add("modbus/gateway", resp_ev)
+        else:
+            server.roles.add(f"modbus/unit_id:{r.unit}", resp_ev)
+
+        ck = ((p.client_ip, r.seen.eth_src), (p.server_ip, s.eth_src))
+        if ck not in self._comms:
+            self._comms[ck] = Communication(client.asset_id, server.asset_id, "tcp", "modbus", PORT)
+        comm = self._comms[ck]
+        comm.record(pair_ev)
+        op = f"modbus/fc:{fc:02d}" + (f":exception:{p.exception:02d}" if p.exception is not None else "")
+        comm.operations.add(op, pair_ev)
+
+        if p.device_id:
+            if r.unit not in _DEVICE_UNITS:
+                self.stats["modbus_device_id_not_attributed_unit"] += 1
+            else:
+                self._identity(server, p.device_id, s, r.unit)
 
     def finish(self, inventory: Inventory) -> None:
         if self._pending:
             self.stats["modbus_request_unanswered"] += len(self._pending)
         self._pending.clear()
         resolve = IpResolver(inventory, self.stats, "modbus")
-        for p in self._pairs:
-            r, s = p.req, p.resp
-            fc = r.fc
-            exc = f" exception {p.exception}" if p.exception is not None else ""
-            tx = f"transaction {r.tid}, unit {r.unit}"
-            client = self._endpoint(resolve, p.client_ip, r.seen, "request")
-            server = self._endpoint(resolve, p.server_ip, s, "response")
-
-            req_ev = Evidence(EvidenceKind.OBSERVED, s.sha, (r.seen.number,), r.seen.ts, self.tag,
-                              f"Modbus FC{fc:02d} request, {tx}, answered in frame {s.number}")
-            resp_ev = Evidence(EvidenceKind.OBSERVED, s.sha, (s.number,), s.ts, self.tag,
-                               f"Modbus FC{fc:02d} response{exc}, {tx}, to request in frame {r.seen.number}")
-            pair_ev = Evidence(EvidenceKind.OBSERVED, s.sha, (r.seen.number, s.number), r.seen.ts, self.tag,
-                               f"Modbus FC{fc:02d} request and response{exc}, {tx}")
-
-            client.roles.add("modbus/client", req_ev)
-            server.roles.add("modbus/server", resp_ev)
-            if p.exception in _GATEWAY_EXCEPTIONS:
-                server.roles.add("modbus/gateway", resp_ev)
-            else:
-                server.roles.add(f"modbus/unit_id:{r.unit}", resp_ev)
-
-            comm = inventory.communication(client, server, "tcp", "modbus", PORT)
-            comm.record(pair_ev)
-            op = f"modbus/fc:{fc:02d}" + (f":exception:{p.exception:02d}" if p.exception is not None else "")
-            comm.operations.add(op, pair_ev)
-
-            if p.device_id:
-                if r.unit not in _DEVICE_UNITS:
-                    self.stats["modbus_device_id_not_attributed_unit"] += 1
-                else:
-                    self._identity(server, p.device_id, s, r.unit)
-        self._pairs.clear()
+        target: dict[tuple[str, str], Asset] = {}
+        for (ip, eth), staged in self._assets.items():
+            target[(ip, eth)] = real = resolve(ip, eth)
+            real.merge_from(staged)
+        for (ck, sk), staged_comm in self._comms.items():
+            comm = inventory.communication(target[ck], target[sk], "tcp", "modbus", PORT)
+            comm.merge_from(staged_comm)
+        self._assets.clear()
+        self._comms.clear()
 
     def _identity(self, asset: Asset, objs: dict[int, str], s: _Seen, unit: int) -> None:
         def ev(oid: int) -> Evidence:

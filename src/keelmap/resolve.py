@@ -14,18 +14,31 @@ from keelmap.model import Asset, Inventory
 
 
 class IpResolver:
+    """Built once per decoder finish(). The IP index is taken when it is first
+    needed, so lookups cost the same however many assets the capture holds."""
+
     def __init__(self, inventory: Inventory, stats: Counter, prefix: str):
         self.inv = inventory
         self.stats = stats
         self.prefix = prefix
         self._cache: dict[tuple[str, str], Asset] = {}
         self._reported: set[tuple[str, str]] = set()
+        self._index: dict[str, list[Asset]] | None = None
+
+    def _owners(self, ip: str) -> list[Asset]:
+        if self._index is None:
+            self._index = {}
+            for a in self.inv.assets.values():
+                if a.identity_key.startswith("mac:"):
+                    for owned in a.ips.values:
+                        self._index.setdefault(owned, []).append(a)
+        return self._index.get(ip, [])
 
     def __call__(self, ip: str, eth_src: str) -> Asset:
         key = (ip, eth_src)
         if key in self._cache:
             return self._cache[key]
-        owners = self.inv.mac_assets_with_ip(ip)
+        owners = self._owners(ip)
         if len(owners) == 1 and owners[0].identity_key == f"mac:{eth_src}":
             asset = owners[0]
         else:

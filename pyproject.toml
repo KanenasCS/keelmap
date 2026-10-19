@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "keelmap"
-version = "0.1.0"
+version = "0.1.1"
 description = "Passive OT and maritime asset discovery with evidence for every field"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE", "src/keelmap/report/vendor/cytoscape.LICENSE"]
-authors = [{ name = "The KeelMap authors" }]
+authors = [{ name = "Konstantinos Lianos", email = "kon_lianos@hotmail.com" }]
 keywords = ["ot-security", "ics", "maritime", "asset-inventory", "modbus", "nmea", "ais", "pcap", "iec-61162-450"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -28,7 +28,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.10"]
 
 [project.scripts]
 keelmap = "keelmap.__main__:main"

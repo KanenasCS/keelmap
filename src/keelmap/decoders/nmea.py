@@ -28,18 +28,17 @@ from __future__ import annotations
 import ipaddress
 import re
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
 from keelmap.decoders.ais import AisError, FragmentBuffer, dearmor, decode_identity
 from keelmap.decoders.base import Frame
 from keelmap.layers import (
     ETH_IPV4,
-    LINKTYPE_ETHERNET,
     is_host_ip,
     mac_str,
-    parse_ethernet,
     parse_ipv4,
+    parse_link,
     parse_udp,
 )
 from keelmap.model import Asset, Evidence, EvidenceKind, Inventory
@@ -65,17 +64,17 @@ class _Source:
     staging: Asset
     ip: str
     eth_src: str
-    frames_seen: set[int] = field(default_factory=set)
 
 
 class NmeaDecoder:
     name = "nmea0183"
-    version = "0.1.0"
+    version = "0.1.1"
 
     def __init__(self) -> None:
         self.stats: Counter[str] = Counter()
         self._sources: dict[tuple[str, str], _Source] = {}
         self._ais = FragmentBuffer()
+        self._messages = 0
 
     @property
     def tag(self) -> str:
@@ -86,13 +85,14 @@ class NmeaDecoder:
         return Evidence(kind, frames[0][2], tuple(f[0] for f in frames), frames[0][1], self.tag, detail)
 
     def handle(self, frame: Frame, inventory: Inventory) -> None:
-        if frame.linktype != LINKTYPE_ETHERNET:
-            return
-        eth = parse_ethernet(frame.data)
+        eth = parse_link(frame.linktype, frame.data)
         if eth is None or eth.ethertype != ETH_IPV4:
             return
         ip = parse_ipv4(eth.payload)
-        if ip is None or ip.proto != 17 or ip.fragment:
+        if ip is None or ip.proto != 17:
+            return
+        if ip.fragment:
+            self.stats["nmea_ip_fragment_skipped"] += 1
             return
         udp = parse_udp(ip.payload)
         if udp is None or not udp.payload:
@@ -120,7 +120,7 @@ class NmeaDecoder:
 
         ref = (frame.number, frame.timestamp, frame.source_sha256)
         src = None
-        for line in candidates:
+        for line_no, line in enumerate(candidates, 1):
             parsed = self._parse_line(line)
             if parsed is None:
                 continue
@@ -128,7 +128,7 @@ class NmeaDecoder:
             if src is None:
                 src = self._source(ip.src, mac_str(eth.src))
                 self._record_datagram(src, ref, ip, udp, iec450)
-            self._record_sentence(src, ref, start, address, fields, tags, iec450, udp.sport)
+            self._record_sentence(src, ref, start, address, fields, tags, iec450, udp.sport, line_no)
 
     # parsing ------------------------------------------------------------------
 
@@ -172,9 +172,7 @@ class NmeaDecoder:
         return self._sources[key]
 
     def _record_datagram(self, src: _Source, ref, ip, udp, iec450: bool) -> None:
-        if ref[0] in src.frames_seen:
-            return
-        src.frames_seen.add(ref[0])
+        """Called once per datagram that holds at least one valid sentence."""
         a = src.staging
         a.ips.add(src.ip, self._ev(EvidenceKind.OBSERVED, [ref], "IP source of NMEA 0183 datagram with valid checksum"))
         if iec450:
@@ -183,15 +181,16 @@ class NmeaDecoder:
             if ipaddress.IPv4Address(ip.dst).is_multicast:
                 a.roles.add(f"iec61162_450/group:{ip.dst}:{udp.dport}", ev)
 
-    def _record_sentence(self, src: _Source, ref, start, address, fields, tags, iec450, sport) -> None:
+    def _record_sentence(self, src: _Source, ref, start, address, fields, tags, iec450, sport, line_no) -> None:
         a = src.staging
+        where = f"line {line_no} of the datagram"
         if address.startswith("P"):
             mfr = address[1:4].lower()
             a.roles.add(f"nmea0183/proprietary:{mfr}", self._ev(
-                EvidenceKind.OBSERVED, [ref], f"proprietary sentence ${address} with valid checksum"))
+                EvidenceKind.OBSERVED, [ref], f"proprietary sentence ${address} with valid checksum, {where}"))
         else:
             talker, stype = address[:2].lower(), address[2:].lower()
-            ev = self._ev(EvidenceKind.OBSERVED, [ref], f"{start}{address} sentence with valid checksum")
+            ev = self._ev(EvidenceKind.OBSERVED, [ref], f"{start}{address} sentence with valid checksum, {where}")
             a.roles.add(f"nmea0183/talker:{talker}", ev)
             a.roles.add(f"nmea0183/sentence:{talker}{stype}", ev)
 
@@ -200,7 +199,7 @@ class NmeaDecoder:
             if _TAG_SOURCE.match(source_id):
                 label = "iec61162_450_sfi" if iec450 else "nmea_tag_source"
                 a.device_ids.add(f"{label}:{source_id}", self._ev(
-                    EvidenceKind.SELF_REPORTED, [ref], f"tag block s: field on {start}{address}"))
+                    EvidenceKind.SELF_REPORTED, [ref], f"tag block s: field on {start}{address}, {where}"))
             else:
                 self.stats["nmea_tag_source_invalid"] += 1
 
@@ -229,12 +228,14 @@ class NmeaDecoder:
         for reason in ident.rejected:
             self.stats[f"ais_{reason}"] += 1
         a = src.staging
-        role_ev = self._ev(EvidenceKind.OBSERVED, refs, f"AIS {kind} type {ident.msg_type} message")
+        self._messages += 1
+        role_ev = self._ev(EvidenceKind.OBSERVED, refs,
+                           f"AIS {kind} type {ident.msg_type} message, number {self._messages}")
         a.roles.add(f"ais/{kind.lower()}", role_ev)
         if kind == "VDM":
             self.stats["ais_vdm_other_vessels_not_inventoried"] += 1
             return
-        detail = f"AIS VDO own-ship type {ident.msg_type}"
+        detail = f"AIS VDO own-ship type {ident.msg_type} message number {self._messages},"
         for label, value in (("mmsi", f"{ident.mmsi:09d}" if ident.mmsi is not None else None),
                              ("imo", str(ident.imo) if ident.imo is not None else None),
                              ("callsign", ident.callsign), ("name", ident.name)):

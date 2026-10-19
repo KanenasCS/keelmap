@@ -113,3 +113,34 @@ def parse_tcp(data: bytes) -> TCP | None:
     if off < 20 or len(data) < off:
         return None
     return TCP(sport, dport, seq, off_flags & 0x01FF, data[off:])
+
+
+LINKTYPE_LINUX_SLL = 113
+LINKTYPE_LINUX_SLL2 = 276
+SUPPORTED_LINKTYPES = {LINKTYPE_ETHERNET, LINKTYPE_LINUX_SLL, LINKTYPE_LINUX_SLL2}
+_ARPHRD_ETHER = 1
+_NO_DST = b"\x00" * 6
+
+
+def _cooked(hatype: int, halen: int, addr: bytes, protocol: int, payload: bytes) -> Ethernet | None:
+    """Linux cooked captures (tcpdump -i any) carry the sender's address and the
+    protocol, but no destination. Only Ethernet senders are accepted. Decoders
+    use the sender only, so the missing destination is left as zeros."""
+    if hatype != _ARPHRD_ETHER or halen != 6:
+        return None
+    return parse_ethernet(_NO_DST + addr[:6] + struct.pack("!H", protocol) + payload)
+
+
+def parse_link(linktype: int, data: bytes) -> Ethernet | None:
+    """Ethernet view of a frame from any supported link type, or None."""
+    if linktype == LINKTYPE_ETHERNET:
+        return parse_ethernet(data)
+    if linktype == LINKTYPE_LINUX_SLL and len(data) >= 16:
+        _pkttype, hatype, halen = struct.unpack("!HHH", data[0:6])
+        (protocol,) = struct.unpack("!H", data[14:16])
+        return _cooked(hatype, halen, data[6:14], protocol, data[16:])
+    if linktype == LINKTYPE_LINUX_SLL2 and len(data) >= 20:
+        (protocol,) = struct.unpack("!H", data[0:2])
+        hatype, _pkttype, halen = struct.unpack("!HBB", data[8:12])
+        return _cooked(hatype, halen, data[12:20], protocol, data[20:])
+    return None

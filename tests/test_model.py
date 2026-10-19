@@ -204,12 +204,39 @@ def test_export_is_json_serialisable_and_versioned():
 def test_merge_keeps_exact_counts_and_times():
     a, b = Asset("ip:10.0.0.5"), Asset("ip:10.0.0.5")
     a.roles.add("modbus/server", ev(frames=(1,), ts=T0))
-    b.roles.add("modbus/server", ev(frames=(1,), ts=T0))   # same evidence, must not double count
     b.roles.add("modbus/server", ev(frames=(2,), ts=T1))
+    b.roles.add("modbus/server", ev(frames=(3,), ts=T1))
     a.merge_from(b)
     m = a.to_dict()["roles"]["members"][0]
-    assert m["evidence_count"] == 2
+    assert m["evidence_count"] == 3
     assert a.to_dict()["first_seen"] == T0.isoformat() and a.to_dict()["last_seen"] == T1.isoformat()
+
+
+def test_repeated_record_counted_once():
+    a = Asset("ip:10.0.0.5")
+    a.roles.add("modbus/server", ev(frames=(1,)))
+    a.roles.add("modbus/server", ev(frames=(1,)))   # same record twice in a row
+    assert a.to_dict()["roles"]["members"][0]["evidence_count"] == 1
+
+
+def test_verification_mode_catches_broken_assumptions(monkeypatch):
+    import keelmap.model as m
+    monkeypatch.setattr(m, "VERIFY_EVIDENCE", True)
+    a, b = Asset("ip:10.0.0.5"), Asset("ip:10.0.0.5")
+    a.roles.add("modbus/server", ev(frames=(1,)))
+    a.roles.add("modbus/server", ev(frames=(2,)))
+    with pytest.raises(PrecisionViolation):
+        a.roles.add("modbus/server", ev(frames=(1,)))   # repeat, not straight after
+    b.roles.add("modbus/server", ev(frames=(2,)))
+    with pytest.raises(PrecisionViolation):
+        a.merge_from(b)                                    # overlap would double count
+
+
+def test_bad_field_pairing_refused():
+    a, b = Asset("ip:10.0.0.5"), Asset("ip:10.0.0.6")
+    b._fields = lambda: list(reversed(Asset._fields(b)))
+    with pytest.raises(PrecisionViolation):
+        a.merge_from(b)
 
 
 def test_evidence_sample_capped_with_exact_count():

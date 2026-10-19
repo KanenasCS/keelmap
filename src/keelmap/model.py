@@ -11,19 +11,31 @@ Rules enforced by this module:
   4. Missing data reads as "unknown". Disagreeing data reads as "conflict"
      with every claim and its evidence kept, never silently resolved.
   5. Sensitive vessel identifiers are redacted on export unless the caller
-     explicitly asks otherwise.
+     explicitly asks otherwise. Redaction uses a secret key (HMAC-SHA256), so a
+     token cannot be reversed by trying every possible MMSI or IMO number.
+
+Memory stays bounded however long the capture: each value keeps an exact count,
+first and last time, and a small sample of citations, never every record.
 """
 
 from __future__ import annotations
 
 import enum
 import hashlib
+import hmac
+import os
 import re
+import secrets
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Generic, Hashable, Iterable, TypeVar
 
 SCHEMA_VERSION = "0.1.0"
+
+# Verification mode for tests and fuzzing: remember every evidence record and
+# fail loudly if the "each record arrives once" assumption is ever broken.
+VERIFY_EVIDENCE = os.environ.get("KEELMAP_VERIFY_EVIDENCE") == "1"
 
 T = TypeVar("T", bound=Hashable)
 
@@ -87,22 +99,34 @@ class Evidence:
 
 
 class _Claim:
-    """Evidence for one value: exact count and time range, plus a capped sample of citations."""
+    """Evidence for one value: exact count and time range, plus a capped sample of citations.
+
+    Decoders emit each record once, and a repeat can only arrive straight after
+    the original (two identical sentences in one datagram, for example), so
+    comparing with the previous record keeps counts exact without remembering
+    every record. merge() requires the two claims to share no records, which
+    holds because every frame is decoded once and staged assets are keyed by source.
+    """
 
     SAMPLE_CAP = 10
-    __slots__ = ("sample", "count", "first", "last", "_seen")
+    __slots__ = ("sample", "count", "first", "last", "_last", "_all")
 
     def __init__(self) -> None:
         self.sample: list[Evidence] = []
         self.count = 0
         self.first: datetime | None = None
         self.last: datetime | None = None
-        self._seen: set[Evidence] = set()
+        self._last: Evidence | None = None
+        self._all: set[Evidence] | None = set() if VERIFY_EVIDENCE else None
 
     def add(self, e: Evidence) -> None:
-        if e in self._seen:
+        if e == self._last:
             return
-        self._seen.add(e)
+        if self._all is not None:
+            if e in self._all:
+                raise PrecisionViolation(f"evidence repeated out of order: {e.detail}")
+            self._all.add(e)
+        self._last = e
         self.count += 1
         if len(self.sample) < self.SAMPLE_CAP:
             self.sample.append(e)
@@ -111,12 +135,14 @@ class _Claim:
             self.last = e.timestamp if self.last is None else max(self.last, e.timestamp)
 
     def merge(self, other: "_Claim") -> None:
+        if self._all is not None and other._all is not None:
+            if self._all & other._all:
+                raise PrecisionViolation("merged claims share evidence records")
+            self._all |= other._all
         for e in other.sample:
-            if e not in self._seen and len(self.sample) < self.SAMPLE_CAP:
+            if len(self.sample) < self.SAMPLE_CAP and e not in self.sample:
                 self.sample.append(e)
-        new = other._seen - self._seen
-        self._seen |= new
-        self.count += other.count - (len(other._seen) - len(new))
+        self.count += other.count
         for t in (other.first, other.last):
             if t is not None:
                 self.first = t if self.first is None else min(self.first, t)
@@ -125,6 +151,36 @@ class _Claim:
     def to_dict(self, value: object) -> dict:
         return {"value": value, "evidence_count": self.count,
                 "evidence": [e.to_dict() for e in self.sample]}
+
+
+class Redactor:
+    """Turns sensitive values into tokens with a secret key.
+
+    With a random key (the default) tokens differ between exports and cannot be
+    linked or reversed. With a key you keep, the same value always gets the same
+    token, so exports can be compared, and only key holders can test a guess.
+    """
+
+    def __init__(self, key: bytes | None = None):
+        self.from_file = key is not None
+        self.key = key if key is not None else secrets.token_bytes(32)
+        if len(self.key) < 16:
+            raise ValueError("redaction key must be at least 16 bytes")
+
+    def token(self, value: object) -> str:
+        return "redacted:" + hmac.new(self.key, str(value).encode(), hashlib.sha256).hexdigest()[:16]
+
+    def describe(self) -> dict:
+        if self.from_file:
+            return {"method": "hmac-sha256", "key": "supplied",
+                    "key_id": hashlib.sha256(b"keelmap-key-id" + self.key).hexdigest()[:12]}
+        return {"method": "hmac-sha256", "key": "random, discarded after export"}
+
+
+def _as_redactor(redact: "Redactor | bool") -> "Redactor | None":
+    if isinstance(redact, Redactor):
+        return redact
+    return Redactor() if redact else None
 
 
 class Attested(Generic[T]):
@@ -176,12 +232,12 @@ class Attested(Generic[T]):
     def seen_range(self) -> list[datetime]:
         return [t for c in self._claims.values() for t in (c.first, c.last) if t is not None]
 
-    def to_dict(self, redact: bool) -> dict:
-        hide = redact and self.sensitive
+    def to_dict(self, redact: "Redactor | bool") -> dict:
+        r = _as_redactor(redact) if self.sensitive else None
         out: dict = {"state": self.state.value}
         if self.state is FieldState.KNOWN:
-            out["value"] = _redacted(self.value) if hide else self.value
-        out["claims"] = [c.to_dict(_redacted(v) if hide else v) for v, c in self._claims.items()]
+            out["value"] = r.token(self.value) if r else self.value
+        out["claims"] = [c.to_dict(r.token(v) if r else v) for v, c in self._claims.items()]
         return out
 
 
@@ -235,11 +291,11 @@ class AttestedSet(Generic[T]):
     def seen_range(self) -> list[datetime]:
         return [t for c in self._members.values() for t in (c.first, c.last) if t is not None]
 
-    def to_dict(self, redact: bool) -> dict:
-        hide = redact and self.sensitive
+    def to_dict(self, redact: "Redactor | bool") -> dict:
+        r = _as_redactor(redact) if self.sensitive else None
         return {
             "state": self.state.value,
-            "members": [c.to_dict(_redacted(v) if hide else v) for v, c in self._members.items()],
+            "members": [c.to_dict(r.token(v) if r else v) for v, c in self._members.items()],
         }
 
 
@@ -290,13 +346,16 @@ class Asset:
         """Fold another asset's evidence into this one. Used when a staged ip: asset
         turns out to belong to a MAC-identity asset."""
         for mine, theirs in zip(self._fields(), other._fields(), strict=True):
-            mine.merge_from(theirs)
+            if type(mine) is not type(theirs) or mine.name != theirs.name:
+                raise PrecisionViolation(f"cannot merge field {theirs.name} into {mine.name}")
+            mine.merge_from(theirs)  # type: ignore[arg-type]
 
     def traffic_times(self) -> list[datetime]:
         """First and last capture times per field value. Registry lookups are not sightings."""
         return [t for f in self._fields() for t in f.seen_range()]
 
-    def to_dict(self, redact: bool = True, extra_times: Iterable[datetime] = ()) -> dict:
+    def to_dict(self, redact: "Redactor | bool" = True, extra_times: Iterable[datetime] = ()) -> dict:
+        redact = _as_redactor(redact) or False
         times = self.traffic_times() + list(extra_times)
         fs, ls = (min(times), max(times)) if times else (None, None)
         return {
@@ -324,14 +383,13 @@ class Communication:
         default_factory=lambda: AttestedSet("operations", _OBS, pattern=_ROLE_RE)
     )
     evidence_sample: list[Evidence] = field(default_factory=list)
-    _frames: set[tuple[str, int]] = field(default_factory=set, repr=False)
+    packet_count: int = 0          # distinct frames, several exchanges can share one
+    _recent: deque = field(default_factory=lambda: deque(maxlen=Communication.FRAME_WINDOW), repr=False)
 
     SAMPLE_CAP = 20
-
-    @property
-    def packet_count(self) -> int:
-        """Distinct frames. Several exchanges can share one frame."""
-        return len(self._frames)
+    # Exchanges that share a frame (several Modbus messages in one TCP segment)
+    # are recorded close together, so recent frames are enough to count each once.
+    FRAME_WINDOW = 256
 
     def __post_init__(self) -> None:
         if self.transport not in {"tcp", "udp", "l2"}:
@@ -347,14 +405,31 @@ class Communication:
         if evidence.kind is not EvidenceKind.OBSERVED:
             raise PrecisionViolation("communications are only recorded from observed traffic")
         self.exchange_count += 1
-        self._frames.update((evidence.source_sha256, f) for f in evidence.frames)
+        for f in evidence.frames:
+            ref = (evidence.source_sha256, f)
+            if ref not in self._recent:
+                self._recent.append(ref)
+                self.packet_count += 1
         ts = evidence.timestamp
         self.first_seen = ts if self.first_seen is None else min(self.first_seen, ts)
         self.last_seen = ts if self.last_seen is None else max(self.last_seen, ts)
         if len(self.evidence_sample) < self.SAMPLE_CAP:
             self.evidence_sample.append(evidence)
 
-    def to_dict(self, redact: bool = True) -> dict:
+    def merge_from(self, other: "Communication") -> None:
+        """Fold in a staged communication. The two never share frames, see _Claim."""
+        self.exchange_count += other.exchange_count
+        self.packet_count += other.packet_count
+        for t in (other.first_seen, other.last_seen):
+            if t is not None:
+                self.first_seen = t if self.first_seen is None else min(self.first_seen, t)
+                self.last_seen = t if self.last_seen is None else max(self.last_seen, t)
+        self.operations.merge_from(other.operations)
+        for e in other.evidence_sample:
+            if len(self.evidence_sample) < self.SAMPLE_CAP:
+                self.evidence_sample.append(e)
+
+    def to_dict(self, redact: "Redactor | bool" = True) -> dict:
         return {
             "src_asset_id": self.src_asset_id,
             "dst_asset_id": self.dst_asset_id,
@@ -401,6 +476,9 @@ class Inventory:
 
     def asset(self, identity_key: str) -> Asset:
         """Get or create. Creation alone stores nothing, fields stay unknown until evidenced."""
+        existing = self.assets.get(hashlib.sha256(identity_key.encode()).hexdigest()[:16])
+        if existing is not None and existing.identity_key == identity_key:
+            return existing
         a = Asset(identity_key)
         return self.assets.setdefault(a.asset_id, a)
 
@@ -413,7 +491,10 @@ class Inventory:
         c = Communication(src.asset_id, dst.asset_id, transport, protocol, dst_port)
         return self.communications.setdefault(c.key, c)
 
-    def to_dict(self, redact: bool = True) -> dict:
+    def to_dict(self, redact: bool = True, redaction_key: bytes | None = None) -> dict:
+        """Export. With redact, sensitive values become keyed tokens: a fresh random
+        key per export unless redaction_key is given."""
+        r: Redactor | None = Redactor(redaction_key) if redact else None
         # An asset is exported only if traffic proves it exists: field evidence
         # or a recorded communication. Created-but-never-seen assets are dropped.
         comm_times: dict[str, list[datetime]] = {}
@@ -421,21 +502,18 @@ class Inventory:
             if c.packet_count == 0:
                 continue
             for aid in (c.src_asset_id, c.dst_asset_id):
-                comm_times.setdefault(aid, []).extend([c.first_seen, c.last_seen])
+                comm_times.setdefault(aid, []).extend(t for t in (c.first_seen, c.last_seen) if t is not None)
         exported = [a for a in self.assets.values() if a.traffic_times() or a.asset_id in comm_times]
         return {
             "schema_version": SCHEMA_VERSION,
             "tool_version": self.tool_version,
             "redacted": redact,
+            "redaction": r.describe() if r else None,
             "sources": [s.to_dict(redact) for s in self.sources],
             "registries": list(self.registries),
-            "assets": [a.to_dict(redact, comm_times.get(a.asset_id, ()))
+            "assets": [a.to_dict(r or False, comm_times.get(a.asset_id, ()))
                        for a in sorted(exported, key=lambda a: a.asset_id)],
-            "communications": [c.to_dict(redact) for _, c in sorted(self.communications.items())
+            "communications": [c.to_dict(r or False) for _, c in sorted(self.communications.items())
                                if c.packet_count > 0],
             "stats": dict(sorted(self.stats.items())),
         }
-
-
-def _redacted(value: object) -> str:
-    return "redacted:" + hashlib.sha256(str(value).encode()).hexdigest()[:12]

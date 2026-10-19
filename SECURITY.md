@@ -23,7 +23,7 @@ we will agree a way to reduce it to synthetic packets.
 - Crashes, hangs or excessive memory use on crafted captures
 - A crafted capture making KeelMap store a value without evidence, or in the wrong field
 - Script, markup or style injection into the HTML chart
-- Redaction failures: vessel identifiers or filenames appearing in a redacted export
+- Redaction failures: vessel identifiers or filenames appearing in, or recoverable from, a redacted export
 - Any network access from KeelMap or from a generated chart
 
 ## Design guarantees

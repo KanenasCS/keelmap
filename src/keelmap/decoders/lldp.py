@@ -35,7 +35,7 @@ import struct
 from collections import Counter
 
 from keelmap.decoders.base import Frame, evidence_for
-from keelmap.layers import ETH_LLDP, LINKTYPE_ETHERNET, is_unicast_mac, mac_str, parse_ethernet
+from keelmap.layers import ETH_LLDP, is_unicast_mac, mac_str, parse_link
 from keelmap.model import EvidenceKind, Inventory
 
 _CAPABILITIES = ["other", "repeater", "bridge", "wlan_access_point", "router", "telephone",
@@ -92,9 +92,7 @@ class LldpDecoder:
         return f"{self.name}@{self.version}"
 
     def handle(self, frame: Frame, inventory: Inventory) -> None:
-        if frame.linktype != LINKTYPE_ETHERNET:
-            return
-        eth = parse_ethernet(frame.data)
+        eth = parse_link(frame.linktype, frame.data)
         if eth is None or eth.ethertype != ETH_LLDP:
             return
         tlvs = parse_tlvs(eth.payload)

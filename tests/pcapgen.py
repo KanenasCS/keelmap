@@ -120,3 +120,16 @@ def lldp_frame(src: str, tlvs: list[bytes], end: bool = True) -> bytes:
 
 def lldp_basic(src: str) -> list[bytes]:
     return [tlv(1, b"\x04" + mac(src)), tlv(2, b"\x07" + b"1"), tlv(3, b"\x00\x78")]
+
+
+def sll(src: str, protocol: int, payload: bytes, hatype: int = 1, pkttype: int = 0) -> bytes:
+    """Linux cooked v1 (link type 113) frame."""
+    addr = mac(src) if hatype == 1 else b""
+    head = struct.pack("!HHH", pkttype, hatype, len(addr)) + addr.ljust(8, b"\x00")
+    return head + struct.pack("!H", protocol) + payload
+
+
+def sll2(src: str, protocol: int, payload: bytes, hatype: int = 1, pkttype: int = 0, ifindex: int = 2) -> bytes:
+    """Linux cooked v2 (link type 276) frame."""
+    addr = mac(src) if hatype == 1 else b""
+    return struct.pack("!HHIHBB", protocol, 0, ifindex, hatype, pkttype, len(addr)) + addr.ljust(8, b"\x00") + payload

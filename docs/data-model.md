@@ -8,6 +8,7 @@ Schema version 0.1.0. Defined in `src/keelmap/model.py`.
 |---|---|
 | schema_version, tool_version | Both in every export |
 | redacted | True unless the caller opted out |
+| redaction | How values were redacted: `hmac-sha256` with a random key discarded after export, or with a supplied key and its `key_id`, a fingerprint that shows which exports share a key without revealing it |
 | sources | One entry per capture: SHA-256, frame count, time range. Filename redacted by default |
 | registries | Reference files used for registry evidence, such as IEEE OUI files: name, SHA-256, entry count, file date |
 | assets | Only assets proven by traffic: field evidence or a recorded communication |
@@ -25,6 +26,8 @@ Field `device_ids` holds identifiers a device announces for itself that are not 
 `identity_key` is `mac:<mac>` for devices on the sensor's own segment, otherwise `ip:<ip>`. In 0.1 a device seen both ways stays as two assets. Merging them needs evidence and is planned for 0.2.
 
 Every value carries `evidence_count`, the exact number of supporting records, and `evidence`, a sample of up to 10 of them with frame numbers. First and last seen are computed from all records, not only the sample.
+
+Counts stay exact without remembering every record, because decoders emit each record once and a repeat can only follow directly after its original. `KEELMAP_VERIFY_EVIDENCE=1` turns on a mode that remembers everything and fails if that ever stops being true. All tests and fuzzing run with it on.
 
 Each field is either single-valued (known, unknown, conflict) or a set (known or unknown, each member with its own evidence). `first_seen` and `last_seen` come from traffic only. Registry lookups do not count as sightings.
 

@@ -37,6 +37,7 @@
   }
   function plural(n, one, many) { return num(n) + " " + (n === 1 ? one : many); }
   function frameText(frames) {
+    if (!frames || !frames.length) return "No frame cited";
     if (frames.length === 1) return "Frame " + frames[0];
     if (frames.length === 2) return "Frames " + frames[0] + " and " + frames[1];
     return "Frames " + frames.slice(0, -1).join(", ") + " and " + frames[frames.length - 1];
@@ -82,9 +83,15 @@
     var ul = child(d, el("ul", "evidence"));
     item.evidence.forEach(function (e) {
       var li = el("li");
-      add(li, el("div", "frames", frameText(e.frames) + (e.source ? " in capture " + e.source : "")));
-      add(li, el("div", null, e.detail));
-      add(li, el("div", "meta", e.kind + " by " + e.decoder + ", " + when(e.time)));
+      if (e.registry) {
+        add(li, el("div", "frames", "From " + e.registry));
+        add(li, el("div", null, e.detail));
+        add(li, el("div", "meta", e.kind + " by " + e.decoder + ", file dated " + when(e.time)));
+      } else {
+        add(li, el("div", "frames", frameText(e.frames) + (e.source ? " in capture " + e.source : "")));
+        add(li, el("div", null, e.detail));
+        add(li, el("div", "meta", e.kind + " by " + e.decoder + ", " + when(e.time)));
+      }
       ul.appendChild(li);
     });
     if (item.count > item.evidence.length) {
@@ -163,6 +170,14 @@
       });
     }
 
+    if (DATA.lookups && DATA.lookups.length) {
+      add(panel, el("h3", null, "Registry lookups"));
+      DATA.lookups.forEach(function (g) {
+        var p = el("p", "gap");
+        add(p, el("span", "n", num(g.count)), el("span", null, g.text));
+        add(panel, p);
+      });
+    }
     add(panel, el("h3", null, DATA.sources.length === 1 ? "Capture" : "Captures"));
     DATA.sources.forEach(function (s) {
       var p = el("p", "gap");

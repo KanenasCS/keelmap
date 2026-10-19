@@ -11,10 +11,14 @@ Each decoder documents what it accepts as evidence and what it deliberately igno
 | Timestamps | UTC, rounded to the nearest microsecond. Binary pcapng resolutions are accurate to within 1 microsecond |
 | Simple Packet Blocks | Counted for numbering, not decoded, because they carry no timestamp (`frame_without_timestamp`) |
 | Truncated files | Complete frames are kept, the rest is counted (`capture_truncated`) |
-| Link types | Ethernet only in 0.1. Others are counted per type (`frames_unsupported_linktype_<n>`) |
+| Damaged files | A record or block with an impossible length, too short for its type, or whose leading and trailing pcapng lengths disagree, stops reading there and is counted (`capture_corrupt_record_length`, `capture_corrupt_block_length`, `capture_corrupt_block`). Records are capped at 1 MiB, so a crafted length cannot exhaust memory |
+| Impossible timestamps | The frame keeps its number but is not decoded (`frame_timestamp_out_of_range`) |
+| Link types | Ethernet (1), Linux cooked v1 (113) and v2 (276) from `tcpdump -i any`. Cooked frames carry the sender's address but no destination, which no decoder uses. Cooked frames from non-Ethernet interfaces such as loopback are counted (`frames_cooked_not_ethernet`). Others are counted per type (`frames_unsupported_linktype_<n>`) |
 | VLAN tags | 802.1Q, 802.1ad and QinQ stripped before decoding |
 
 ## ARP (arp@0.1.0)
+
+Ethernet II framing only. ARP inside 802.2 LLC/SNAP (legacy token ring and FDDI translation) is not decoded.
 
 | Stored | From |
 |---|---|
@@ -62,6 +66,8 @@ LLDP is a device describing itself, so nearly everything is self_reported. Frame
 | vendor, model, firmware | LLDP-MED Manufacturer Name, Model Name, Firmware Revision | self_reported |
 | device_ids `lldp_chassis_mac:`, `lldp_chassis_local:`, `lldp_management_ipv4:`, `lldp_management_ipv6:`, `lldp_med_serial:`, `lldp_med_asset_id:`, `mud_url:` | Chassis ID, Management Address, LLDP-MED inventory, RFC 8520 MUD URL | self_reported |
 
+A switch sends LLDP from each port's own MAC, so a switch seen on several ports appears as several assets, each carrying the same chassis id in device_ids. Merging them would mean trusting a self-reported id, so it is left to the reader.
+
 | Not stored | Why | Counter |
 |---|---|---|
 | Vendor, model or version parsed from the description | Free text has no reliable structure. "SMCGS8P-Smart - SMCGS8P-Smart v3.20" names no vendor at all | none |
@@ -88,7 +94,7 @@ A match fills only `nic_vendor`, as registry evidence citing the file's SHA-256.
 
 A prefix the registry lists for several organisations stores all of them, so `nic_vendor` shows a conflict (`oui_prefix_listed_for_several_organisations`). The February 2024 MA-L file has two: 00-01-C8 and 08-00-30, which has three holders.
 
-## Modbus/TCP (modbus@0.1.0)
+## Modbus/TCP (modbus@0.1.1)
 
 Pairing is the proof. Only a request and a response on the same TCP connection, with the same transaction id, unit id and function code, store anything. Port 502 alone proves nothing.
 
@@ -107,17 +113,20 @@ Pairing is the proof. Only a request and a response on the same TCP connection, 
 | Responses without a matching request | Includes captures that start mid-exchange and duplicate copies | `modbus_response_unpaired` |
 | Transaction, unit or function mismatch | Not provably the same exchange | `modbus_response_mismatch` |
 | Non-Modbus data on port 502 | Other protocols use the port | `modbus_port_502_not_mbap` |
+| Endpoints that are not host addresses | TCP from a broadcast or multicast address is not real traffic | `modbus_endpoint_not_host_ip` |
 | Device identity for unit ids other than 0 and 255 | May describe a serial device behind a gateway, not the TCP endpoint | `modbus_device_id_not_attributed_unit` |
 | ADUs split across TCP segments | No TCP reassembly in 0.1 | `modbus_adu_split_across_segments` |
 | Modbus on ports other than 502 | Not detected in 0.1 | none, nothing is seen |
 
 Transaction ids: a repeat with the same TCP sequence number is a retransmission and the original frame is cited. A repeat with a new sequence number is a new request and the older one counts as unanswered. Many simple clients always send transaction id 0, so keeping the oldest would wrongly reject every exchange after one lost response.
 
+Memory: pairs are folded into per-source staging as soon as they are seen. Pending requests are capped at 65,536, the oldest counts as unanswered.
+
 IP to asset: an IP joins a MAC-identity asset only when exactly one such asset has ARP or DHCP evidence for it and the Modbus frame's Ethernet source is that same MAC. Otherwise it becomes an `ip:<address>` asset (`modbus_ip_owner_mac_differs`, `modbus_ip_owner_ambiguous`).
 
 Undefined function codes are kept when answered. A client sending code 0 and receiving "illegal function" is a real exchange.
 
-## NMEA 0183 over UDP (nmea0183@0.1.0)
+## NMEA 0183 over UDP (nmea0183@0.1.1)
 
 Detected by content on any UDP port, because NMEA over UDP has no fixed port. A sentence counts only when it is well formed and its checksum is valid.
 
@@ -129,7 +138,7 @@ Detected by content on any UDP port, because NMEA over UDP has no fixed port. A 
 | `iec61162_450/sender`, `iec61162_450/group:<address>:<port>` | Datagrams starting `UdPbC\0`, group only for multicast destinations | observed |
 | device_ids `iec61162_450_sfi:<id>` or `nmea_tag_source:<id>` | Tag block `s:` field with a valid tag checksum | self_reported |
 | Roles `ais/vdm`, `ais/vdo` | Complete AIS messages | observed |
-| vessel_identifiers `mmsi:`, `imo:`, `callsign:`, `name:` | Own-ship `VDO` messages only. Redacted on export by default | self_reported |
+| vessel_identifiers `mmsi:`, `imo:`, `callsign:`, `name:` | Own-ship `VDO` messages only, types 5, 19 and 24 for the static identity. Redacted on export by default | self_reported |
 
 A talker id describes the instrument behind a sentence, not the network device. One IP sending GP, HE and SD sentences is usually a multiplexer or gateway, so roles record what was sent, not what the device is.
 
@@ -142,6 +151,7 @@ A talker id describes the instrument behind a sentence, not the network device. 
 | MMSI 0 or above nine digits | Not a valid MMSI | `ais_mmsi_invalid` |
 | AIS fragments out of order or missing | Not provably one message | `ais_fragments_incomplete` |
 | IEC 61162-450 binary (`RaUdP`) datagrams | Not supported in 0.1 | `iec61162_450_binary_not_supported` |
+| Fragmented UDP datagrams | Not reassembled | `nmea_ip_fragment_skipped` |
 | Communications | UDP is one-way, a destination address is not evidence of a receiver | none |
 
 IP to asset uses the same rule as Modbus, with counters prefixed `nmea0183_`.
@@ -169,15 +179,15 @@ tshark 4.2 has no NMEA dissector, so two independent libraries are the reference
 
 | Check | Data | Result |
 |---|---|---|
-| AIS identity decoding against pyais | 86,168 real sentences, 83,564 complete messages | 89,077 field values compared (MMSI 83,360, IMO 1,151, call sign 2,193, name 2,373), 0 differences after stripping leading space padding, which pyais also strips |
+| AIS identity decoding against pyais | 86,168 real sentences, 83,564 complete messages | 89,077 field values compared (MMSI 83,360, IMO 1,151, call sign 2,193, name 2,373), 0 differences after stripping leading space padding, which pyais also strips. Type 19 names added in 0.1.1: 109 compared, 0 differences |
 | Rejections | Same data | 104 IMO numbers rejected for a failed check digit, all MMSIs rejected were genuinely out of range, every payload KeelMap called invalid also failed in pyais |
 | End to end, AIS source | 600 real sentences in UDP datagrams, 1 to 3 sentences each | 518 messages decoded and 69 invalid, identical to pyais's own stream assembler |
 | End to end, own ship | A real type 5 message relabelled as VDO, fragments in separate datagrams | MMSI, IMO, call sign and name match pyais, evidence cites both fragment frames, all four values absent from the redacted export |
 | End to end, NMEA validity | Real GPS, proprietary and tag-block lines inside IEC 61162-450 datagrams | KeelMap and pynmea2 reject exactly the same 4 lines. Sentence counts per type match. pynmea2 cannot parse AIS sentences, so those were checked with pyais above |
 
-Out-of-order AIS fragments (pyais includes deliberate test cases) are counted as incomplete rather than reassembled. Real transponders send fragments in order.
+Out-of-order AIS fragments (pyais includes deliberate test cases) are counted as incomplete rather than reassembled. Real transponders send fragments in order. At most 4,096 unfinished messages are held, the oldest is dropped and counted.
 
-Not yet validated: a packet capture from a real bridge network. The captures above are built from real sentences, but the UDP framing, ports and multicast layout are mine. An authorised capture from a vessel is still the most important missing check.
+The maritime captures above combine real recorded sentences with UDP framing, ports and multicast layout built for the tests. The natural next step is an authorised capture from a vessel, which would extend this validation to a live bridge network.
 
 ### LLDP and OUI
 
@@ -187,4 +197,29 @@ Not yet validated: a packet capture from a real bridge network. The captures abo
 | LLDP-MED inventory | Built frames, no public capture has these TLVs | tshark decodes the built frames with the intended manufacturer and model |
 | OUI lookups against netaddr 1.3.0 | IEEE MA-L file (35,087 entries, February 2024) as shipped in netaddr, every prefix with a random host part, plus 20,000 random MACs | 0 differences once prefixes with several holders are compared as sets. netaddr and a last-wins reading each silently pick one holder for 00-01-C8 and 08-00-30, KeelMap shows the conflict |
 | OUI names against tshark | 8 MACs from accepted assets in the LLDP and DHCP captures | Names identical to tshark's own resolution |
-| MA-M, MA-S and the CSV layout | Small files in the official layout, the IEEE site is not reachable from the build environment | Parser tested on hand-written files only. Worth a run against the current official CSV files |
+| The official CSV files | `oui.csv` (40,347 rows), `mam.csv` (6,641) and `oui36.csv` (7,235) downloaded from the IEEE in October 2026 | All rows load. 162,600 lookups against the longest matching official prefix across the three files, 0 wrong. Every MA-M and MA-S prefix checked resolves to its own holder through the IEEE-held parent block. Names keep the IEEE's exact text, including its own `?` characters in some non-Latin names |
+| Names against tshark's bundled list | 13 MACs from real captures | 9 identical, 3 differ only in capitalisation (tshark reformats, KeelMap keeps the IEEE text), 1 reflects a newer registry (F8:ED:A5 is now Commscope, formerly ARRIS Group) |
+
+### Robustness (0.1.1)
+
+| Check | Result |
+|---|---|
+| Byte-level fuzzing of whole capture files | 0.1.0 crashed on 9 distinct malformed inputs, all in the reader, including a 4 GB allocation. After the fix, 48,479 inputs ran with no crash, hang or invariant violation |
+| Structure-aware fuzzing of packet contents, aimed at the decoders | 43,852 inputs, no crash and no invariant violation, before and after the fix |
+| Real `tcpdump -i any` captures, both cooked formats | Asset, IP and NMEA roles match tshark, the 3 loopback frames are counted as non-Ethernet |
+| Memory on long captures | 0.1.0: 666 MB for 320,000 NMEA datagrams. 0.1.1: 20 MB, flat |
+| IP resolution on large networks | 0.1.0: 4 times the devices took 14 times as long. 0.1.1: 96,000 assets in 7.5 seconds |
+| Cross-checks after the changes | Modbus still matches tshark on all 8 traces, DHCP and LLDP still match tshark, AIS own-ship still matches pyais |
+
+Invariants checked on every fuzzing input: every exported value has evidence, cited frames exist in their capture, timestamps fall inside it, fields are filled only from their allowed evidence kinds, communications point at exported assets, and no raw vessel identifier appears in a redacted export.
+
+### Second review pass (0.1.1)
+
+| Check | Data | Result |
+|---|---|---|
+| ARP against tshark | Zeek traces: `arp-who-has`, `communityid/arp`, `linuxsll-arp` (cooked), `arp-leak` (crafted address sizes), `snap-arp` | Every MAC to IP binding matches. All 6 `arp-leak` frames rejected as not Ethernet/IPv4. SNAP ARP is outside Ethernet II framing and ignored |
+| DHCP against tshark | 10 Zeek and Wireshark traces, 575 DHCP frames, 14 assets: flood, INFORM, relay agent options, bad cookie, hardware type edge cases | Roles, hostnames and addresses match on every trace. The flood's 250 ACKs from spoofed source addresses and a growth test's 49 forged client addresses are correctly withheld |
+| LLDP-MED inventory against tshark | Built frames with every inventory TLV | Manufacturer, model, firmware, serial and asset id all read as tshark reads them |
+| Consistency invariants on every real capture | 39 captures | Modbus server, unit, gateway, client, operation and exchange counts all reconcile, NMEA talker and sentence counts agree, scans are deterministic |
+| Fuzzing with the consistency invariants | 20,000 inputs | No failures |
+| Empty chart | Capture with no decodable device | Renders with no errors |

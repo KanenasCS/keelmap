@@ -27,6 +27,10 @@ _PCAP_MAGICS = {
     b"\xa1\xb2\x3c\x4d": (">", 1_000_000_000),
 }
 _PCAPNG_SHB = b"\x0a\x0d\x0d\x0a"
+# Largest record accepted. Real Ethernet captures stay far below this, and a
+# larger claimed length means a damaged or crafted file, not a real packet.
+MAX_RECORD = 1 << 20
+_MIN_BODY = {1: 8, 2: 20, 3: 4, 6: 20}   # block type -> minimum body length
 
 
 class CaptureError(ValueError):
@@ -41,11 +45,14 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def _ts(ticks: int, units_per_sec: int, offset_sec: int = 0) -> datetime:
-    """Round to the nearest microsecond, the finest unit datetime holds."""
+def _ts(ticks: int, units_per_sec: int, offset_sec: int = 0) -> datetime | None:
+    """Round to the nearest microsecond. None if the time cannot be represented."""
     sec, frac = divmod(ticks, units_per_sec)
     usec = (frac * 1_000_000 + units_per_sec // 2) // units_per_sec
-    return _EPOCH + timedelta(seconds=sec + offset_sec, microseconds=usec)
+    try:
+        return _EPOCH + timedelta(seconds=sec + offset_sec, microseconds=usec)
+    except OverflowError:
+        return None
 
 
 @dataclass
@@ -78,7 +85,10 @@ class CaptureReader:
             else:
                 raise CaptureError(f"{self.path.name}: not a pcap or pcapng file")
 
-    def _emit(self, number: int, ts: datetime, data: bytes, linktype: int) -> Frame:
+    def _emit(self, number: int, ts: datetime | None, data: bytes, linktype: int) -> Frame | None:
+        if ts is None:
+            self.stats["frame_timestamp_out_of_range"] += 1
+            return None
         self.first_ts = ts if self.first_ts is None else min(self.first_ts, ts)
         self.last_ts = ts if self.last_ts is None else max(self.last_ts, ts)
         return Frame(number, ts, data, linktype, self.sha256)
@@ -101,12 +111,17 @@ class CaptureReader:
                 self.stats["capture_truncated"] += 1
                 return
             sec, frac, incl, _orig = rec.unpack(h)
+            if incl > MAX_RECORD:
+                self.stats["capture_corrupt_record_length"] += 1
+                return
             data = f.read(incl)
             if len(data) < incl:
                 self.stats["capture_truncated"] += 1
                 return
             self.frame_count += 1
-            yield self._emit(self.frame_count, _ts(sec * units + frac, units), data, linktype)
+            fr = self._emit(self.frame_count, _ts(sec * units + frac, units), data, linktype)
+            if fr is not None:
+                yield fr
 
     # pcapng -------------------------------------------------------------------
 
@@ -130,40 +145,56 @@ class CaptureReader:
                     raise CaptureError(f"{self.path.name}: bad pcapng byte-order magic")
                 btype = 0x0A0D0D0A
                 total = struct.unpack(endian + "I", head[4:])[0]
+                if not 28 <= total <= MAX_RECORD:
+                    self.stats["capture_corrupt_block_length"] += 1
+                    return
                 body = bom + f.read(total - 12)
                 ifaces = []
             else:
                 btype, total = struct.unpack(endian + "II", head)
+                if not 12 <= total <= MAX_RECORD:
+                    self.stats["capture_corrupt_block_length"] += 1
+                    return
                 body = f.read(total - 8)
-            if total < 12 or len(body) < total - 8:
+            if len(body) < total - 8:
                 self.stats["capture_truncated"] += 1
                 return
+            if struct.unpack(endian + "I", body[-4:])[0] != total:
+                # Leading and trailing lengths disagree, so the file is damaged here.
+                self.stats["capture_corrupt_block_length"] += 1
+                return
             body = body[:-4]  # trailing block length
+            if len(body) < _MIN_BODY.get(btype, 0):
+                self.stats["capture_corrupt_block"] += 1
+                return
 
             if btype == 1:  # Interface Description Block
                 linktype, _res, snaplen = struct.unpack(endian + "HHI", body[:8])
                 ifaces.append(self._idb_options(endian, linktype, snaplen, body[8:]))
             elif btype == 6:  # Enhanced Packet Block
                 iid, hi, lo, cap, _orig = struct.unpack(endian + "IIIII", body[:20])
-                self.frame_count += 1
-                if iid >= len(ifaces):
-                    self.stats["frame_unknown_interface"] += 1
-                    continue
-                i = ifaces[iid]
-                yield self._emit(self.frame_count, _ts((hi << 32) | lo, i.units, i.offset),
-                                 body[20:20 + cap], i.linktype)
+                fr = self._packet(ifaces, iid, hi, lo, cap, body[20:])
+                if fr is not None:
+                    yield fr
             elif btype == 2:  # Packet Block (obsolete)
                 iid, _drops, hi, lo, cap, _orig = struct.unpack(endian + "HHIIII", body[:20])
-                self.frame_count += 1
-                if iid >= len(ifaces):
-                    self.stats["frame_unknown_interface"] += 1
-                    continue
-                i = ifaces[iid]
-                yield self._emit(self.frame_count, _ts((hi << 32) | lo, i.units, i.offset),
-                                 body[20:20 + cap], i.linktype)
+                fr = self._packet(ifaces, iid, hi, lo, cap, body[20:])
+                if fr is not None:
+                    yield fr
             elif btype == 3:  # Simple Packet Block: no timestamp, so no evidence possible
                 self.frame_count += 1
                 self.stats["frame_without_timestamp"] += 1
+
+    def _packet(self, ifaces, iid, hi, lo, cap, data) -> Frame | None:
+        self.frame_count += 1
+        if iid >= len(ifaces):
+            self.stats["frame_unknown_interface"] += 1
+            return None
+        if cap > len(data):
+            self.stats["frame_capture_length_exceeds_block"] += 1
+            return None
+        i = ifaces[iid]
+        return self._emit(self.frame_count, _ts((hi << 32) | lo, i.units, i.offset), data[:cap], i.linktype)
 
     @staticmethod
     def _idb_options(endian: str, linktype: int, snaplen: int, opts: bytes) -> _Iface:
@@ -174,8 +205,13 @@ class CaptureReader:
             val = opts[pos + 4:pos + 4 + length]
             if code == 0:
                 break
+            if len(val) < length:
+                break
             if code == 9 and length >= 1:  # if_tsresol
                 r = val[0]
+                # Above 2^63 or 10^18 ticks per second no clock exists, treat as damaged.
+                if (r & 0x80 and (r & 0x7F) > 63) or (not r & 0x80 and r > 18):
+                    break
                 iface.units = 2 ** (r & 0x7F) if r & 0x80 else 10 ** r
             elif code == 14 and length >= 8:  # if_tsoffset, seconds
                 iface.offset = struct.unpack(endian + "q", val[:8])[0]

@@ -24,6 +24,8 @@ One HTML file, about 550 KB, that opens with no network access. It is drawn like
 
 Shapes come from roles in the inventory, in a fixed order. Labels translate roles, they never upgrade them. A source sending `$GPGGA` is shown as "Sent NMEA sentences with talker id GP", not as a GPS receiver, and nothing is ever called a PLC.
 
+Network card maker evidence names the IEEE registry file and its SHA-256 instead of frames, since it comes from a registry, not from traffic.
+
 The side panel shows, for each asset, what it did, what it says about itself, its addresses and its connections. Every value opens to the frames behind it. Fields with no evidence are listed together as not stated. Conflicting claims are shown together, never resolved. The overview lists everything seen but not turned into evidence, so coverage gaps are visible.
 
 ## Safety

@@ -1,0 +1,10 @@
+# Same bytes on every platform.
+* text=auto eol=lf
+
+# Vendored library: keep byte-exact, its SHA-256 is checked on every render.
+src/keelmap/report/vendor/cytoscape.min.js -text
+
+# Binary files
+*.pcap binary
+*.pcapng binary
+*.png binary

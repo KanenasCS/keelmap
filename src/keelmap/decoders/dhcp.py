@@ -29,12 +29,11 @@ from collections import Counter
 from keelmap.decoders.base import Frame, evidence_for
 from keelmap.layers import (
     ETH_IPV4,
-    LINKTYPE_ETHERNET,
     is_host_ip,
     is_unicast_mac,
     mac_str,
-    parse_ethernet,
     parse_ipv4,
+    parse_link,
     parse_udp,
 )
 from keelmap.model import EvidenceKind, Inventory
@@ -86,9 +85,7 @@ class DhcpDecoder:
         return f"{self.name}@{self.version}"
 
     def handle(self, frame: Frame, inventory: Inventory) -> None:
-        if frame.linktype != LINKTYPE_ETHERNET:
-            return
-        eth = parse_ethernet(frame.data)
+        eth = parse_link(frame.linktype, frame.data)
         if eth is None or eth.ethertype != ETH_IPV4:
             return
         ip = parse_ipv4(eth.payload)

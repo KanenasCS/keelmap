@@ -1,7 +1,7 @@
 """AIS payload decoding (ITU-R M.1371), limited to identity fields.
 
 Only what an inventory needs: message type, MMSI, and the static identity in
-types 5 and 24 (IMO number, call sign, vessel name). Positions, speeds and
+types 5, 19 and 24 (IMO number, call sign, vessel name). Positions, speeds and
 voyage data are deliberately not decoded.
 
 Validation applied, because a wrong vessel identity is worse than none:
@@ -93,6 +93,8 @@ def decode_identity(bits: str) -> AisIdentity:
         name = _text(bits, 112, 20)
         if len(bits) < 232:
             rejected.append("type5_truncated")
+    elif mtype == 19:
+        name = _text(bits, 143, 20)
     elif mtype == 24:
         part = _uint(bits, 38, 2)
         if part == 0:
@@ -103,7 +105,13 @@ def decode_identity(bits: str) -> AisIdentity:
 
 
 class FragmentBuffer:
-    """Reassemble multi-sentence AIS messages per source and sequential message id."""
+    """Reassemble multi-sentence AIS messages per source and sequential message id.
+
+    Holds at most MAX_OPEN unfinished messages. Beyond that the oldest is dropped
+    and counted as incomplete, so a lossy feed cannot grow memory without limit.
+    """
+
+    MAX_OPEN = 4096
 
     def __init__(self) -> None:
         self._open: dict[tuple, dict] = {}
@@ -120,6 +128,10 @@ class FragmentBuffer:
         entry = self._open.get(key)
         if num == 1:
             if entry is not None:
+                self.incomplete += 1
+                del self._open[key]
+            elif len(self._open) >= self.MAX_OPEN:
+                del self._open[next(iter(self._open))]
                 self.incomplete += 1
             entry = self._open[key] = {"parts": {}, "fill": 0}
         elif entry is None or num in entry["parts"]:

@@ -73,9 +73,39 @@ CAPABILITY_LABELS = {
     "svlan_component": "Service VLAN component", "tpmr": "Two-port MAC relay", "other": "Other",
 }
 
+# Counters that record evidence being created, not skipped. Kept out of gap lists.
+EVIDENCE_STATS = {
+    "oui_matched": "MACs whose card maker was found in the IEEE registry files",
+    "oui_prefix_listed_for_several_organisations": "MACs whose prefix the IEEE lists for several organisations",
+}
+
 STAT_EXPLANATIONS = {
+    "oui_locally_administered": "Locally administered MACs, assigned by software, not looked up",
+    "oui_multicast": "Multicast MACs, not looked up",
+    "oui_private": "MAC prefixes the IEEE lists as private",
+    "oui_registration_authority_block": "MAC prefixes held by the IEEE itself, give the MA-M and MA-S files too",
+    "oui_not_found": "MAC prefixes not in the registry files given",
+    "dhcp_chaddr_mismatch": "DHCP client messages whose hardware address differs from the Ethernet source",
+    "dhcp_server_id_mismatch": "DHCP server replies sent from an address other than their server identifier",
+    "dhcp_malformed": "DHCP messages that could not be parsed",
+    "lldp_malformed_discarded": "LLDP frames that break the IEEE 802.1AB structure rules",
+    "lldp_source_not_unicast": "LLDP frames from a zero or multicast source address",
+    "modbus_response_mismatch": "Modbus replies whose unit or function differs from the pending request",
+    "modbus_request_retransmitted": "Repeated Modbus requests with the same TCP sequence number",
+    "modbus_ip_owner_mac_differs": "Modbus endpoints whose IP belongs to a MAC other than the frame's source",
+    "modbus_ip_owner_ambiguous": "Modbus endpoints whose IP is claimed by several MACs",
+    "nmea0183_ip_owner_mac_differs": "NMEA sources whose IP belongs to a MAC other than the frame's source",
+    "nmea0183_ip_owner_ambiguous": "NMEA sources whose IP is claimed by several MACs",
+    "nmea_ip_fragment_skipped": "Fragmented UDP datagrams, not reassembled",
     "frames_without_timestamp": "Packets without a timestamp cannot be cited as evidence",
+    "frame_timestamp_out_of_range": "Packets with an impossible timestamp, the file may be damaged",
+    "frame_unknown_interface": "Packets referring to an interface the file never described",
+    "frame_capture_length_exceeds_block": "Packets claiming more data than their block holds",
     "capture_truncated": "The capture file ends mid-packet",
+    "frames_cooked_not_ethernet": "Packets from non-Ethernet interfaces in a tcpdump -i any capture, such as loopback",
+    "capture_corrupt_record_length": "A packet claims an impossible length, reading stopped there",
+    "capture_corrupt_block_length": "A pcapng block has an impossible length, reading stopped there",
+    "capture_corrupt_block": "A pcapng block is too short for its type, reading stopped there",
     "capture_duplicate_skipped": "The same capture file was given twice",
     "arp_sender_mac_mismatch": "ARP sender differs from the Ethernet source, possibly relayed or forged",
     "arp_probe_no_ip": "Address-conflict probes, the device has no address yet",
@@ -94,6 +124,25 @@ STAT_EXPLANATIONS = {
 }
 
 
+class InventoryError(ValueError):
+    """The file is not an inventory this version can draw."""
+
+
+def explain_stat(key: str) -> str:
+    """Plain words for a skip counter, shared by the command line and the chart."""
+    if key in STAT_EXPLANATIONS:
+        return STAT_EXPLANATIONS[key]
+    if key in EVIDENCE_STATS:
+        return EVIDENCE_STATS[key]
+    if key.startswith("frames_unsupported_linktype_"):
+        return f"Packets of link type {key.rsplit('_', 1)[1]}, which KeelMap cannot read"
+    return key.replace("_", " ").capitalize()
+
+
+# Registry files used in the inventory being drawn, by SHA-256, set by build_view.
+_REGISTRIES: dict[str, str] = {}
+
+
 def _evidence(ev_list: list[dict], multi_source: bool) -> list[dict]:
     out = []
     for e in ev_list:
@@ -104,7 +153,10 @@ def _evidence(ev_list: list[dict], multi_source: bool) -> list[dict]:
             "decoder": e["decoder"],
             "time": e["timestamp"],
         }
-        if multi_source:
+        if e["kind"] == "registry":
+            sha = e["source_sha256"]
+            item["registry"] = f"{_REGISTRIES.get(sha, 'registry file')}, SHA-256 {sha[:12]}"
+        elif multi_source:
             item["source"] = e["source_sha256"][:12]
         out.append(item)
     return out
@@ -184,9 +236,29 @@ def _operation(value: str) -> dict:
     return out
 
 
+def validate_inventory(inv: object) -> None:
+    """Raise InventoryError unless inv is an inventory this version can draw."""
+    if not isinstance(inv, dict):
+        raise InventoryError("top level is not an object")
+    for key, kind in (("schema_version", str), ("tool_version", str), ("redacted", bool),
+                      ("sources", list), ("assets", list), ("communications", list)):
+        if not isinstance(inv.get(key), kind):
+            raise InventoryError(f"missing or invalid {key}")
+    if not inv["schema_version"].startswith("0."):
+        raise InventoryError(f"schema {inv['schema_version']} is newer than this KeelMap")
+    try:
+        build_view(inv)
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as e:
+        raise InventoryError(f"unexpected structure ({type(e).__name__}: {e})") from e
+
+
 def build_view(inv: dict) -> dict:
+    _REGISTRIES.clear()
+    _REGISTRIES.update({r["sha256"]: r["name"] for r in inv.get("registries", [])})
     multi = len(inv["sources"]) > 1
-    nodes, edges, groups = [], [], {}
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    groups: dict[str, dict] = {}
     for a in inv["assets"]:
         roles = a["roles"]["members"]
         role_values = [m["value"] for m in roles]
@@ -251,8 +323,10 @@ def build_view(inv: dict) -> dict:
         })
 
     stats = inv.get("stats", {})
-    gaps = [{"key": k, "count": v, "text": STAT_EXPLANATIONS.get(k)}
-            for k, v in sorted(stats.items(), key=lambda kv: (-kv[1], kv[0])) if k != "frames_read"]
+    gaps = [{"key": k, "count": v, "text": explain_stat(k)}
+            for k, v in sorted(stats.items(), key=lambda kv: (-kv[1], kv[0]))
+            if k != "frames_read" and k not in EVIDENCE_STATS]
+    lookups = [{"key": k, "count": v, "text": explain_stat(k)} for k, v in sorted(stats.items()) if k in EVIDENCE_STATS]
     return {
         "schema_version": inv["schema_version"],
         "tool_version": inv["tool_version"],
@@ -263,5 +337,6 @@ def build_view(inv: dict) -> dict:
         "groups": list(groups.values()),
         "edges": edges,
         "gaps": gaps,
+        "lookups": lookups,
         "kinds": [{"kind": k, "label": label} for k, label, _ in NODE_KINDS],
     }

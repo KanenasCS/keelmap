@@ -14,7 +14,7 @@ from keelmap.decoders.dhcp import DhcpDecoder
 from keelmap.decoders.lldp import LldpDecoder
 from keelmap.decoders.modbus import ModbusDecoder
 from keelmap.decoders.nmea import NmeaDecoder
-from keelmap.layers import LINKTYPE_ETHERNET
+from keelmap.layers import SUPPORTED_LINKTYPES, parse_link
 from keelmap.model import Inventory, SourceCapture
 from keelmap.oui import OuiRegistry, apply_oui
 
@@ -38,8 +38,11 @@ def scan(paths: Iterable[str | Path], decoders: Sequence[Decoder] | None = None,
         seen.add(reader.sha256)
         for frame in reader:
             stats["frames_read"] += 1
-            if frame.linktype != LINKTYPE_ETHERNET:
+            if frame.linktype not in SUPPORTED_LINKTYPES:
                 stats[f"frames_unsupported_linktype_{frame.linktype}"] += 1
+                continue
+            if frame.linktype != 1 and parse_link(frame.linktype, frame.data) is None:
+                stats["frames_cooked_not_ethernet"] += 1
                 continue
             for d in decoders:
                 d.handle(frame, inv)

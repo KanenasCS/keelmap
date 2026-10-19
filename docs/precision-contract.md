@@ -51,3 +51,9 @@ AIS sentences describe vessels heard over radio. Those vessels are not assets on
 ## Validation standard
 
 Public sample captures are for development. A release claim needs at least one authorised capture from a real vessel or port network, with every exported asset checked against ground truth from the operator.
+
+## Redaction
+
+Redacted exports replace vessel identifiers and capture filenames. Identifiers become HMAC-SHA256 tokens with a secret key, never plain hashes: MMSI and IMO numbers are few enough that a plain hash can be reversed by trying them all. Without `--redaction-key` the key is random and discarded, so tokens cannot be reversed or linked between exports. With a key you keep, tokens are stable across exports, and only key holders can test a guess.
+
+Redaction covers fields KeelMap knows are sensitive. A hostname or description a device chose for itself, such as one containing the ship's name, is stored as sent. Review those before sharing.

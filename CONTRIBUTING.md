@@ -14,7 +14,8 @@ ruff check src tests tools
 ```
 
 Install tshark (`apt install tshark`) to run the tests that compare against it.
-They are skipped otherwise.
+They are skipped otherwise. Tests run with evidence verification on and include
+a short fuzzing run. For a long one: `python tools/fuzz.py 50000`.
 
 ## Adding or changing a decoder
 
@@ -23,6 +24,8 @@ They are skipped otherwise.
 3. Pick the evidence kind honestly. Something a device says about itself is `self_reported`, behaviour seen in traffic is `observed`. There is no inferred kind, on purpose.
 4. Validate against an independent reference, such as tshark or a well-known protocol library, on public captures, and record the result in the validation log in `docs/decoders.md`. Explain every difference, do not tune until the numbers match.
 5. Bump the decoder version when its output changes.
+6. Make each evidence record unique per event (name the transaction, sentence or message), so counts stay exact. The verification mode in the tests fails if not.
+7. Keep per-capture state bounded: stage results per source, cap anything that waits for a reply.
 
 ## Test data
 

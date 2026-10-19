@@ -6,7 +6,7 @@ Passive asset discovery for ship and port networks. Give KeelMap a packet captur
 
 ## Why
 
-Ship operators now need an inventory of onboard systems for IACS UR E26, and commercial OT visibility platforms are priced for large enterprises. Generic open-source ICS tools exist, but none focus on maritime protocols or on evidence you can check.
+IACS UR E26 asks new ships, contracted for construction on or after 1 July 2024, to identify the computer-based systems on board, with mandatory and non-mandatory scope depending on vessel type and size. Older ships and port operators face the same question without the rule. Commercial OT visibility platforms are priced for large enterprises, and the open-source ICS tools we know of are generic rather than maritime, and do not show the evidence behind each field.
 
 KeelMap is built around one rule: **report what the traffic proves, nothing more.**
 
@@ -21,7 +21,7 @@ KeelMap is built around one rule: **report what the traffic proves, nothing more
 Python 3.11 or later, no runtime dependencies.
 
 ```
-git clone https://github.com/<your-account>/keelmap.git
+git clone https://github.com/KanenasCS/keelmap.git
 cd keelmap
 pip install .
 ```
@@ -44,6 +44,15 @@ Draw a chart from an existing inventory:
 
 ```
 keelmap map inventory.json -o chart.html
+```
+
+Captures from `tcpdump -i any` (Linux cooked format) work as well as plain Ethernet captures.
+
+Redacted exports replace vessel identifiers with tokens made with a secret key, so they cannot be reversed by trying every MMSI or IMO number. By default the key is random and discarded, so tokens differ between exports. To compare exports over time, create a key once and keep it private:
+
+```
+keelmap keygen -o redaction.key
+keelmap scan bridge.pcapng -o inventory.json --redaction-key redaction.key
 ```
 
 `--no-redact` keeps vessel identifiers and filenames, and only writes to `*.unredacted.json` and `*.unredacted.html`, which git ignores.
@@ -74,11 +83,14 @@ Every decoder is checked against an independent reference on public captures, an
 | NMEA 0183 | pynmea2 | Same sentences accepted and rejected |
 | LLDP | tshark, 19 frames from tcpdump and Zeek | All accepted frames match, every discarded frame is one tshark marks malformed |
 | IEEE OUI | netaddr, all 35,084 MA-L prefixes | 0 differences |
-| DHCP | tshark, Wireshark's own test captures | Every value, frame and timestamp matching |
+| DHCP | tshark, 10 Zeek and Wireshark traces, 575 frames | Roles, hostnames and addresses match on every trace |
+| ARP | tshark, Zeek traces including cooked format and crafted frames | Every binding matches, crafted frames rejected |
 
 Cross-checking also found real bugs, both in KeelMap and in assumptions the references make. They are listed in the [validation log](docs/decoders.md#validation-log).
 
-**Not yet validated: a capture from a real vessel network.** All test data is public, and some maritime captures are built from real sentences with synthetic framing. If you operate vessels or port systems and can share an authorised capture under suitable terms, please get in touch.
+Every test run also fuzzes 800 damaged and hostile captures and checks that nothing is stored without evidence, no cited frame falls outside its capture, counts reconcile across roles and communications, scans are deterministic and no redacted export leaks an identifier. `tools/fuzz.py` runs longer campaigns. Memory stays flat however long the capture: about 20 MB for nine hours of a 10 Hz source.
+
+All validation uses public captures and real recorded sentences, so anyone can repeat it. The next step is a live bridge network. If you operate vessels or port systems and can share an authorised capture under suitable terms, please get in touch.
 
 ## The asset chart
 
@@ -88,7 +100,7 @@ Inventories carry strings from network traffic, so the chart is built to be open
 
 ## Status
 
-Version 0.1. Captures in, inventory and chart out.
+Version 0.1.1. Captures in, inventory and chart out. See [CHANGELOG.md](CHANGELOG.md).
 
 Planned: S7comm and DNP3, change detection between captures, Microsoft Sentinel ingestion through a data collection rule, a live sensor mode, and an IACS UR E26 inventory report.
 
